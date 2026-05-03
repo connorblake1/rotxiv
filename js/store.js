@@ -161,3 +161,16 @@ export function markStreakMilestone(n) {
 }
 
 export function reset() { state = structuredClone(DEFAULT); persist(); }
+
+export function setAll(next) {
+  if (!next || typeof next !== 'object') throw new Error('invalid state');
+  state = { ...structuredClone(DEFAULT), ...next,
+    follows: { ...DEFAULT.follows, ...(next.follows || {}) },
+    stats:   { ...DEFAULT.stats,   ...(next.stats || {}) },
+    streak:  { ...DEFAULT.streak,  ...(next.streak || {}) } };
+  persist();
+}
+
+export function snapshot() {
+  return JSON.parse(JSON.stringify(state));
+}

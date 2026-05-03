@@ -5,6 +5,7 @@ import { FeedEngine } from './feed.js';
 import { renderCard, escapeHtml } from './ui.js';
 import { CATEGORIES } from './config.js';
 import { onAppOpen, onPaperViewed, pushToast, buzz } from './notifications.js';
+import * as sync from './sync.js';
 
 const app = document.getElementById('app');
 
@@ -52,7 +53,8 @@ router.register('/feed', mount => {
     <div class="feed" id="feed">
       ${skeleton()}
     </div>
-    <div class="loadmore"><button class="btn" id="loadmore">load more</button></div>
+    <div class="feed-sentinel" id="feed-sentinel"></div>
+    <div class="feed-end" id="feed-end" hidden>that's all for now — pull to refresh</div>
   `);
   bindFeed();
   loadFeed(true);
@@ -94,6 +96,7 @@ router.register('/saved', mount => {
 
 router.register('/profile', mount => {
   const s = store.get();
+  const cfg = sync.getGistConfig();
   mount.innerHTML = chrome('profile', `
     <div class="profile">
       <div class="profile-avatar"></div>
@@ -108,19 +111,132 @@ router.register('/profile', mount => {
         <p>${s.follows.categories.length} topics · ${s.follows.keywords.length} keywords · ${s.follows.authors.length} authors</p>
         <a class="btn" href="#/explore">manage</a>
       </div>
+
+      <div class="follows-summary">
+        <h3>storage</h3>
+        <p id="storage-status">checking…</p>
+        <button class="btn" id="ask-persist">make storage permanent</button>
+      </div>
+
+      <div class="follows-summary">
+        <h3>cloud sync (github gist)</h3>
+        <p class="muted">paste a github personal access token with the <b>gist</b> scope. your follows + history will sync to a private gist on your account, surviving wipes and following you across devices.</p>
+        <div class="sync-row">
+          <input class="kw-input" id="gist-token" type="password" autocomplete="off" placeholder="${cfg.token ? '••• token saved •••' : 'ghp_… (gist scope only)'}" value="">
+        </div>
+        <div class="sync-buttons">
+          <button class="btn btn-primary" id="sync-save-token">${cfg.token ? 'replace token' : 'save & push now'}</button>
+          ${cfg.token ? '<button class="btn" id="sync-pull">pull from gist</button>' : ''}
+          ${cfg.token ? '<button class="btn" id="sync-push">push now</button>' : ''}
+          ${cfg.token ? '<button class="btn btn-ghost" id="sync-disable">disable sync</button>' : ''}
+        </div>
+        <p class="muted" id="sync-status">${cfg.gistId ? `synced to gist <code>${cfg.gistId.slice(0,8)}…</code>` : (cfg.token ? 'token saved — push to create gist' : 'not signed in')}</p>
+        <p class="muted hint">create a token at <a href="https://github.com/settings/tokens?scopes=gist&amp;description=arXivrot%20sync" target="_blank" rel="noopener">github.com/settings/tokens</a> — fine-grained or classic, only the <b>gist</b> scope.</p>
+      </div>
+
+      <div class="follows-summary">
+        <h3>backup code</h3>
+        <p class="muted">a long string with all your data. paste into a note for safekeeping or restore on any other browser.</p>
+        <div class="sync-buttons">
+          <button class="btn" id="backup-copy">copy backup</button>
+          <button class="btn" id="backup-restore">restore from clipboard</button>
+        </div>
+      </div>
+
       <div class="danger">
         <button class="btn btn-ghost" id="reset">reset everything</button>
       </div>
     </div>
   `);
+
+  sync.isPersisted().then(p => {
+    const el = document.getElementById('storage-status');
+    if (!el) return;
+    if (p === true)        el.innerHTML = '✅ <b>persistent</b> — won\'t be evicted.';
+    else if (p === false)  el.innerHTML = '⚠️ best-effort — iOS Safari can clear this. tap below to upgrade.';
+    else                   el.innerHTML = 'storage status unknown on this browser.';
+  });
+
+  document.getElementById('ask-persist').addEventListener('click', async () => {
+    const r = await sync.requestPersistent();
+    if (!r.supported)     pushToast('this browser does not support persistent storage.', 'info');
+    else if (r.granted)   { pushToast('✅ storage is now persistent.', 'xp'); buzz(20); }
+    else                  pushToast('browser said no — try installing to home screen first, then retry.', 'info');
+    setTimeout(() => router.resolve(), 600);
+  });
+
+  document.getElementById('sync-save-token').addEventListener('click', async () => {
+    const v = document.getElementById('gist-token').value.trim();
+    if (!v && !cfg.token) { pushToast('paste a token first.', 'info'); return; }
+    if (v) sync.saveGistToken(v, cfg.gistId);
+    setStatus('pushing…');
+    try {
+      const r = await sync.pushToGist();
+      pushToast(`✅ ${r.action} gist`, 'xp');
+      buzz(20);
+      sync.startAutoSync();
+      setTimeout(() => router.resolve(), 400);
+    } catch (e) { setStatus('push failed: ' + e.message); }
+  });
+
+  const pull = document.getElementById('sync-pull');
+  if (pull) pull.addEventListener('click', async () => {
+    if (!confirm('replace local data with whatever is in your gist?')) return;
+    setStatus('pulling…');
+    try {
+      const r = await sync.pullFromGist();
+      pushToast(`✅ pulled from ${r.gistId.slice(0,8)}…`, 'xp');
+      buzz(20);
+      setTimeout(() => router.resolve(), 400);
+    } catch (e) { setStatus('pull failed: ' + e.message); }
+  });
+
+  const push = document.getElementById('sync-push');
+  if (push) push.addEventListener('click', async () => {
+    setStatus('pushing…');
+    try {
+      const r = await sync.pushToGist();
+      pushToast(`✅ pushed (${r.action})`, 'xp');
+      setTimeout(() => router.resolve(), 400);
+    } catch (e) { setStatus('push failed: ' + e.message); }
+  });
+
+  const dis = document.getElementById('sync-disable');
+  if (dis) dis.addEventListener('click', () => {
+    if (!confirm('forget the token from this device? your gist itself is not deleted.')) return;
+    sync.saveGistToken('', '');
+    pushToast('sync disabled on this device.', 'info');
+    setTimeout(() => router.resolve(), 200);
+  });
+
+  document.getElementById('backup-copy').addEventListener('click', async () => {
+    const code = sync.exportToString();
+    try { await navigator.clipboard.writeText(code); pushToast('✅ backup copied to clipboard', 'xp'); buzz(20); }
+    catch { prompt('copy this:', code); }
+  });
+
+  document.getElementById('backup-restore').addEventListener('click', async () => {
+    let s = '';
+    try { s = await navigator.clipboard.readText(); } catch {}
+    if (!s) s = prompt('paste backup code:') || '';
+    if (!s) return;
+    if (!confirm('replace all current data with the pasted backup?')) return;
+    try { sync.importFromString(s.trim()); pushToast('✅ restored', 'xp'); setTimeout(() => router.resolve(), 400); }
+    catch (e) { pushToast('failed: ' + e.message, 'info'); }
+  });
+
   document.getElementById('reset').addEventListener('click', () => {
     if (confirm('Wipe all data and re-onboard?')) { store.reset(); location.hash = ''; boot(); }
   });
+
+  function setStatus(s) { const el = document.getElementById('sync-status'); if (el) el.textContent = s; }
 });
 
 function skeleton() {
   return Array.from({ length: 4 }).map(() => '<div class="card skeleton"><div class="card-thumb skel"></div><div class="card-body"><div class="skel-line"></div><div class="skel-line"></div></div></div>').join('');
 }
+
+let feedObserver = null;
 
 function bindFeed() {
   const tabs = app.querySelector('.feed-tabs');
@@ -131,32 +247,35 @@ function bindFeed() {
     for (const x of tabs.querySelectorAll('[data-mode]')) x.classList.toggle('on', x === t);
     loadFeed(true);
   });
-  const more = app.querySelector('#loadmore');
-  if (more) more.addEventListener('click', () => loadFeed(false));
   const bell = app.querySelector('[data-bell]');
   if (bell) bell.addEventListener('click', () => { pushToast('keep scrolling — knowledge unlocks at <b>25</b>/day.', 'info'); buzz(8); });
 
+  const sentinel = app.querySelector('#feed-sentinel');
   const content = app.querySelector('.content');
-  content.addEventListener('scroll', onScroll, { passive: true });
-}
-
-let scrollLock = false;
-async function onScroll(e) {
-  if (scrollLock) return;
-  const el = e.currentTarget;
-  if (el.scrollTop + el.clientHeight > el.scrollHeight - 600) {
-    scrollLock = true;
-    await loadFeed(false);
-    scrollLock = false;
+  if (feedObserver) { feedObserver.disconnect(); feedObserver = null; }
+  if (sentinel && content) {
+    feedObserver = new IntersectionObserver(entries => {
+      for (const e of entries) {
+        if (e.isIntersecting && !scrollLock) {
+          scrollLock = true;
+          loadFeed(false).finally(() => { scrollLock = false; });
+        }
+      }
+    }, { root: content, rootMargin: '800px 0px', threshold: 0 });
+    feedObserver.observe(sentinel);
   }
 }
 
+let scrollLock = false;
+
 async function loadFeed(reset) {
   const feed = document.getElementById('feed');
+  const end  = document.getElementById('feed-end');
   if (!feed) return;
   if (reset) {
     feed.innerHTML = skeleton();
     engines[activeMode] = new FeedEngine(activeMode);
+    if (end) end.hidden = true;
   }
   const eng = engines[activeMode];
   await eng.ensureBatch(8);
@@ -169,9 +288,10 @@ async function loadFeed(reset) {
     onPaperViewed();
     added++;
   }
-  if (eng.isDone() && !feed.children.length) {
+  if (!feed.children.length && eng.isDone()) {
     feed.innerHTML = '<div class="empty">arxiv is being shy. try again in a sec.</div>';
   }
+  if (eng.isDone() && end) end.hidden = false;
 }
 
 function bindExplore() {
@@ -213,6 +333,11 @@ function boot() {
   if (!store.isOnboarded()) {
     renderOnboarding(app, () => { boot(); });
     return;
+  }
+  sync.requestPersistent().catch(() => {});
+  sync.startAutoSync();
+  if (sync.gistEnabled()) {
+    sync.pullFromGist().catch(() => {});
   }
   onAppOpen();
   if (!location.hash) location.hash = '#/feed';
